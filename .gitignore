@@ -1,0 +1,6 @@
+# raw datasets (~2 GB, not redistributable)
+data/
+
+.venv/
+__pycache__/
+.DS_Store
