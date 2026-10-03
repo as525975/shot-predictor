@@ -6,14 +6,20 @@ import lightgbm as lgb
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, Field
 
-from features import MAX_BALLS, SOURCE_FOR_FORMAT, build_features
+from features import MAX_BALLS, build_features, serve_row
+from plan import bowling_plan
+from similar import Similar
 
 HERE = Path(__file__).parent
 model = lgb.Booster(model_file=str(HERE / 'model.txt'))
+runs_model = lgb.Booster(model_file=str(HERE / 'runs_model.txt'))
+wicket_model = lgb.Booster(model_file=str(HERE / 'wicket_model.txt'))
 meta = json.loads((HERE / 'meta.json').read_text())
 zones = json.loads((HERE / 'zones.json').read_text())
+sim = Similar(HERE / 'profiles.npz')
 
 
 def scoring_zones(batter, shot, a=40):
@@ -33,6 +39,7 @@ class Prev(BaseModel):
 
 
 class Ball(BaseModel):
+    model_config = ConfigDict(extra='forbid')  # unknown fields (e.g. a batting hand) are rejected, not silently ignored
     format: Literal['T20', 'ODI', 'Test']
     batter: str
     bowl_style: str
@@ -47,7 +54,6 @@ class Ball(BaseModel):
     runs: int = Field(0, ge=0)
     wkts: int = Field(0, ge=0, le=9)
     target: Optional[int] = Field(None, ge=1)
-    bat_hand: Optional[Literal['RHB', 'LHB']] = None  # defaults to the batter's known hand
     ground: Optional[str] = None
     daynight: Optional[str] = None
 
@@ -71,30 +77,78 @@ def predict(b: Ball):
         raise HTTPException(422, f'{b.format} has only {max_balls // 6} overs')
     if b.inns > (4 if b.format == 'Test' else 2):
         raise HTTPException(422, f'{b.format} has only 2 innings')
-    source = SOURCE_FOR_FORMAT[b.format]
-    # the ODI/Test data has no variation column, so a variation there would be a combination never seen in training
-    variation = (b.variation or 'stock') if source == 'odata' else None
     known = meta['batters'].get(b.batter)
-    balls = (b.over - 1) * 6 + len(b.prev)  # ponytail: assumes earlier balls this over were legal
-    row = dict(format=b.format, source=source, bat=b.batter, bat_hand=b.bat_hand or (known or {}).get('hand', 'RHB'),
-               bowl_style=b.bowl_style, variation=variation, line=b.line, length=b.length, over=b.over,
-               ball_no=len(b.prev) + 1, bat_bf=b.balls_faced, bat_runs=b.bat_runs, inns=b.inns, runs=b.runs,
-               wkts=b.wkts, balls=balls, balls_rem=max_balls - balls if max_balls else None,
-               target=b.target if b.inns == 2 else None, ground=b.ground, daynight=b.daynight)
-    for k, p in enumerate(reversed(b.prev), 1):  # p1 = most recent ball
-        row.update({f'p{k}_line': p.line, f'p{k}_length': p.length, f'p{k}_shot': p.shot, f'p{k}_score': p.runs})
-    for k in range(len(b.prev) + 1, 6):
-        row.update({f'p{k}_line': None, f'p{k}_length': None, f'p{k}_shot': None, f'p{k}_score': None})
+    hand = known['hand'] if known else 'RHB'  # batting hand comes from the data; an unknown batter is a typical right-hander
+    row = serve_row(b.format, b.batter, hand, b.bowl_style, b.line, b.length,
+                    b.over, [p.model_dump() for p in b.prev], b.balls_faced, b.bat_runs, b.inns, b.runs, b.wkts,
+                    b.target, b.variation, b.ground, b.daynight)
     probs = model.predict(build_features(pd.DataFrame([row])))[0]
     shots = sorted(zip(meta['classes'], probs), key=lambda s: -s[1])
     return {'shots': {s: round(float(p) * 100, 1) for s, p in shots},
             'top': [{'shot': s, 'pct': round(float(p) * 100, 1), **scoring_zones(b.batter, s)} for s, p in shots[:3]],
             'batter_known': known is not None, 'batter_balls_in_data': (known or {}).get('balls', 0),
-            'variation_used': variation is not None}
+            'variation_used': row['variation'] is not None}
+
+
+class PlanRequest(BaseModel):
+    batter: str
+    format: Literal['T20', 'ODI']  # Test plans come later
+    bowl_style: Optional[str] = None  # None -> the recommended bowler type per phase
+
+
+def plan(r: PlanRequest):
+    check(r.bowl_style, meta['bowl_styles'], 'bowl_style')
+    p = bowling_plan(model, runs_model, wicket_model, meta, zones, r.batter, r.format, r.bowl_style, scoring_zones)
+    # test the plan on batters who play like him: at least as similar as the top 10% of all pairs
+    similars = [x for x in sim.similar(r.batter, r.format, 8) if x['score'] >= sim.reference(r.format)['top10']]
+    p['similar'] = similars
+    return sim.evaluate_plan(p, similars, r.format)
+
+
+class SimilarRequest(BaseModel):
+    batter: str
+    format: Literal['T20', 'ODI', 'Test']
+    k: int = Field(10, ge=1, le=30)
+
+
+def similar_players(r: SimilarRequest):
+    if r.batter not in sim.idx:
+        raise HTTPException(404, f'{r.batter} has too little data to profile (needs 200+ labelled balls)')
+    return {'batter': r.batter, 'format': r.format, 'hand': sim.hands[sim.idx[r.batter]],
+            'reference': sim.reference(r.format),  # similarity of the top 1% / 5% / 10% of all pairs
+            'similar': sim.similar(r.batter, r.format, r.k)}
+
+
+class CompareRequest(BaseModel):
+    a: str
+    b: str
+    format: Literal['T20', 'ODI', 'Test']
+
+
+def compare(r: CompareRequest):
+    for n in (r.a, r.b):
+        if n not in sim.idx:
+            raise HTTPException(404, f'{n} has too little data to profile')
+    return sim.compare(r.a, r.b, r.format)
 
 
 app = FastAPI(title='Shot predictor')
+app.post('/plan')(plan)
+app.post('/similar')(similar_players)
+app.post('/compare')(compare)
 app.post('/predict')(predict)
 app.get('/options')(lambda: {k: v for k, v in meta.items() if k != 'batters'}
-                    | {'batters': [[n, v['hand'], v['balls']] for n, v in meta['batters'].items()]})
-app.get('/')(lambda: FileResponse(HERE / 'index.html'))
+                    | {'batters': [[n, v['hand'], v['balls']] for n, v in meta['batters'].items()],
+                       'profiled': sim.names})  # batters with a style profile, i.e. valid on the Similar players tab
+# no-cache: browsers re-check the page, so an update is never hidden behind a stale copy
+app.get('/')(lambda: FileResponse(HERE / 'static' / 'index.html', headers={'Cache-Control': 'no-cache'}))
+
+
+class Static(StaticFiles):  # no-cache: the browser re-checks every file, so an update is never hidden behind a stale copy
+    async def get_response(self, path, scope):
+        r = await super().get_response(path, scope)
+        r.headers['Cache-Control'] = 'no-cache'
+        return r
+
+
+app.mount('/static', Static(directory=HERE / 'static'), name='static')

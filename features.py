@@ -58,12 +58,18 @@ CAT = ['format', 'source', 'bat', 'bat_hand', 'bowl_style', 'variation', 'line',
 NUM = ['over', 'ball_no', 'bat_bf', 'bat_runs', 'inns', 'runs', 'wkts', 'balls', 'balls_rem', 'rr', 'rrr'] \
       + [c for c in PREV if c.endswith('score')]
 FEATURES = CAT + NUM
-# zone / bat_run are outcomes: kept for the scoring-region diagrams only, never model features
-KEEP = list(dict.fromkeys(['p_match', 'date', 'inns', 'over', 'shot', 'teams', 'target', 'zone', 'bat_run'] + [c for c in FEATURES if c not in ('phase', 'rr', 'rrr')]))
+# zone / bat_run / bowl_run / bat_out are outcomes (scoring diagrams, runs + wicket models), never model features
+KEEP = list(dict.fromkeys(['p_match', 'date', 'inns', 'over', 'shot', 'teams', 'target', 'zone', 'bat_run', 'bowl_run', 'bat_out'] + [c for c in FEATURES if c not in ('phase', 'rr', 'rrr')]))
 
 BBB_COLS = ['p_match', 'inns', 'over', 'ball', 'date', 'bat', 'bat_hand', 'bowl_style', 'line', 'length', 'shot',
             'score', 'out', 'wide', 'noball', 'ballfaced', 'batruns', 'cur_bat_bf', 'cur_bat_runs', 'team_bat', 'team_bowl',
-            'inns_runs', 'inns_wkts', 'inns_balls', 'max_balls', 'target', 'ground', 'daynight', 'wagonZone']
+            'inns_runs', 'inns_wkts', 'inns_balls', 'max_balls', 'target', 'ground', 'daynight', 'wagonZone', 'dismissal', 'bowlruns']
+# dismissals the bowler earns (run-outs excluded); all of these dismiss the striker
+BBB_OUT = {'caught', 'bowled', 'leg before wicket', 'stumped', 'hit wicket'}
+O_OUT = {'Caught', 'CaughtAndBowled', 'CaughtSub', 'Bowled', 'Lbw', 'Stumped', 'HitWicket'}
+# bowling-plan phases (same boundaries as the 'phase' feature in build_features)
+PHASES = {'T20': [('powerplay', 1, 6), ('middle', 7, 15), ('death', 16, 20)],
+          'ODI': [('powerplay', 1, 10), ('middle', 11, 40), ('death', 41, 50)]}
 
 
 def teams_key(a, b):
@@ -105,7 +111,9 @@ def load_bbb(path, fmt, log):
     df['balls'] = df.inns_balls - legal
     df['balls_rem'] = (df.max_balls if 'max_balls' in df else np.nan) - df.balls
     df['zone'] = [BBB_ZONE.get(h, {}).get(z) for h, z in zip(df.bat_hand, df.wagonZone)]
-    df['bat_run'] = df.batruns
+    df['bat_run'] = df.batruns.clip(lower=0)  # 50 scorer corrections are negative
+    df['bat_out'] = df.dismissal.isin(BBB_OUT).astype(int)
+    df['bowl_run'] = df.bowlruns.clip(lower=0)  # batter runs + wides + no-balls (byes/leg byes aren't the bowler's)
     df['p_match'] = 'b' + df.p_match.astype(int).astype(str)
     df['date'] = pd.to_datetime(df.date)
     if 'daynight' not in df:
@@ -118,7 +126,7 @@ def load_odata(path, bbb, log):
     Matches already in the bbb files are dropped (bbb has exact match state)."""
     cols = ['fixtureId', 'team1', 'team2', 'matchDate', 'timestamp', 'format', 'ground', 'inns', 'batsman', 'bowler',
             'batsmanHand', 'bowlerHand', 'bowlerType', 'over', 'ball', 'runs', 'runs_scored', 'extras', 'is_wicket',
-            'commentary', 'shot', 'shot_type', 'area', 'line', 'length', 'variation']
+            'commentary', 'shot', 'shot_type', 'area', 'line', 'length', 'variation', 'dismissalType', 'runs_conceded']
     o = pd.read_csv(path, low_memory=False, usecols=cols)
     n = len(o)
     o = o.drop_duplicates()
@@ -148,7 +156,8 @@ def load_odata(path, bbb, log):
     o = o[ok].sort_values(['fixtureId', 'inns', 'over', 'ball', 'timestamp'], kind='stable').reset_index(drop=True)
 
     wide = o.commentary.str.contains(r'^(?:[A-Z]+! )?Wide\b', na=False)
-    legal = (~wide & ~o.commentary.str.contains(r'^(?:[A-Z]+! )?No ball\b', na=False)).astype(int)
+    noball = o.commentary.str.contains(r'^(?:[A-Z]+! )?No ball\b', na=False)
+    legal = (~wide & ~noball).astype(int)
     o['score'] = o.runs
     bat_r = o.runs_scored.fillna(o.runs - o.extras)
     inn = o.groupby(['fixtureId', 'inns'])
@@ -191,6 +200,8 @@ def load_odata(path, bbb, log):
     o['target'] = np.where((o.inns == 2) & o.format.isin(MAX_BALLS), o.fixtureId.map(first) + 1, np.nan)
     o['zone'] = o.area.map(O_ZONE)
     o['bat_run'] = bat_r
+    o['bat_out'] = o.dismissalType.isin(O_OUT).astype(int)
+    o['bowl_run'] = o.runs_conceded.fillna(bat_r + np.where(wide | noball, o.extras, 0)).clip(lower=0)
     o['p_match'] = 'o' + o.fixtureId.astype(str)
     o = add_prev(o, ['fixtureId', 'inns', 'over'])
     return o[KEEP]
@@ -219,3 +230,33 @@ def build_features(df):
     for c in NUM:
         df[c] = pd.to_numeric(df[c], errors='coerce')
     return df[FEATURES]
+
+
+def serve_row(format, batter, bat_hand, bowl_style, line, length, over, prev=(), bat_bf=0, bat_runs=0, inns=1,
+              runs=0, wkts=0, target=None, variation=None, ground=None, daynight=None):
+    """One prediction row in the loaders' pre-ball layout. Used by the app and the bowling plan.
+    prev = earlier balls this over (oldest first) as dicts with line/length/shot/runs."""
+    source = SOURCE_FOR_FORMAT[format]
+    # the ODI/Test data has no variation column, so a variation there would be a combination never seen in training
+    variation = (variation or 'stock') if source == 'odata' else None
+    max_balls = MAX_BALLS.get(format)
+    prev = list(prev)
+    balls = (over - 1) * 6 + len(prev)  # ponytail: assumes earlier balls this over were legal
+    row = dict(format=format, source=source, bat=batter, bat_hand=bat_hand, bowl_style=bowl_style, variation=variation,
+               line=line, length=length, over=over, ball_no=len(prev) + 1, bat_bf=bat_bf, bat_runs=bat_runs, inns=inns,
+               runs=runs, wkts=wkts, balls=balls, balls_rem=max_balls - balls if max_balls else None,
+               target=target if inns == 2 else None, ground=ground, daynight=daynight)
+    for k in range(1, 6):  # p1 = most recent ball
+        p = prev[-k] if k <= len(prev) else {}
+        row.update({f'p{k}_line': p.get('line'), f'p{k}_length': p.get('length'), f'p{k}_shot': p.get('shot'),
+                    f'p{k}_score': p.get('runs')})
+    return row
+
+
+def recency_weight(dates, half_life_years, ref=None):
+    """Weight per ball: 1 for the newest, halving every half_life_years. None/0 -> every ball counts the same."""
+    dates = pd.to_datetime(pd.Series(dates))
+    if not half_life_years:
+        return np.ones(len(dates))
+    ref = dates.max() if ref is None else pd.Timestamp(ref)
+    return 0.5 ** ((ref - dates).dt.days.to_numpy() / 365.25 / half_life_years)
