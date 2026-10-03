@@ -1,0 +1,5 @@
+fastapi==0.128.8
+uvicorn==0.39.0
+lightgbm==4.6.0
+pandas==2.3.3
+numpy==2.0.2

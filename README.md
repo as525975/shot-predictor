@@ -290,6 +290,18 @@ The response contains:
 
 `GET /options` lists the allowed values for each field, and the batters with their batting hand.
 
+## Deploy (Google Cloud Run)
+
+The `Dockerfile` serves the app with only the trained files (no training code, no raw data). Retraining means rebuilding and redeploying, because the models are baked into the image.
+
+```bash
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com
+gcloud run deploy shot-predictor --source . --region europe-west1 \
+  --memory 1Gi --cpu 1 --min-instances 0 --max-instances 1 --cpu-boost --allow-unauthenticated
+```
+
+`--max-instances 1` caps cost and `--min-instances 0` means no charge while idle. Drop `--allow-unauthenticated` to keep the service private.
+
 ## Limitations
 
 - **Bowling plans are ODI and T20 only** so far.
